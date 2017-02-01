@@ -10,6 +10,9 @@ import (
 	"math/rand"
 	"time"
 	"strconv"
+	"fmt"
+	"errors"
+	"math"
 )
 
 var mainBot *tgbotapi.BotAPI
@@ -24,30 +27,51 @@ type WebhookConfig struct {
 
 type WhoUser struct {
 	*tgbotapi.User
-	Yes bool
+	Choice int
 }
 
 type WhoMessage struct {
 	Users []WhoUser
 	Question string
+	Choices []string
 }
 
 var WhoMap = map[string]WhoMessage{}
 var ArticleIDMap = map[string]WhoMessage{}
 
-var inlineKeyboardWho = tgbotapi.InlineKeyboardMarkup{
-	InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{
-		[]tgbotapi.InlineKeyboardButton{
-			{
-				Text: "Yes",
-				CallbackData: strToPointer("1"),
-			},
-			{
-				Text: "No",
-				CallbackData: strToPointer("0"),
-			},
-		},
-	},
+func generateInlineKeyboard(whoMsg WhoMessage) *tgbotapi.InlineKeyboardMarkup {
+	ikb := [][]tgbotapi.InlineKeyboardButton{}
+	idx := 0
+	for i := 0; i < int(math.Ceil(float64(len(whoMsg.Choices))/2)); i++ {
+		ibkA := []tgbotapi.InlineKeyboardButton{}
+		nxtIdx := idx+2
+		if len(whoMsg.Choices) < nxtIdx {
+			nxtIdx = len(whoMsg.Choices)
+		}
+		choices := whoMsg.Choices[idx:nxtIdx]
+		for _, choice := range choices {
+			ibkA = append(ibkA, tgbotapi.InlineKeyboardButton{
+				Text: choice,
+				CallbackData: strToPointer(strconv.Itoa(idx)),
+			})
+			idx++
+		}
+		ikb = append(ikb, ibkA)
+	}
+	return &tgbotapi.InlineKeyboardMarkup{
+		InlineKeyboard: ikb,
+	}
+
+}
+
+func NewWhoMessage(question string, choices ...string) WhoMessage {
+	if len(choices) == 0 {
+		choices = []string{"Yes", "No"}
+	}
+	return WhoMessage{
+		Question: question,
+		Choices: choices,
+	}
 }
 
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -136,26 +160,9 @@ func startBot(token string, webhookConf *WebhookConfig) {
 				}
 			}
 		} else if update.InlineQuery != nil {
-			question := update.InlineQuery.Query
-			if question == "" {
-				question = "Who's Down"
-			}
-
-			whoMsg := WhoMessage{
-				Question: question,
-			}
-			articleID := RandStringBytesMaskImprSrc(32)
-			ArticleIDMap[articleID] = whoMsg
-
-			res := tgbotapi.NewInlineQueryResultArticleHTML(articleID, question, generateWhoList(whoMsg))
-			res.ReplyMarkup = &inlineKeyboardWho
-			bot.AnswerInlineQuery(tgbotapi.InlineConfig{
-				InlineQueryID: update.InlineQuery.ID,
-				Results: []interface{}{
-					res,
-				},
-			})
+			runInlineQueryWhoCommand(bot, update.InlineQuery)
 		}
+
 		if update.ChosenInlineResult != nil {
 			whoMsg, ok := ArticleIDMap[update.ChosenInlineResult.ResultID]
 			if !ok {
@@ -191,24 +198,59 @@ func formatUser(user *tgbotapi.User) string {
 	}
 }
 
+type Choice struct{
+	Choice string
+	Users []string
+}
+
 func generateWhoList(whoMsg WhoMessage) string {
-	yesNames := []string{}
-	noNames := []string{}
-	for _, user := range whoMsg.Users {
-		if user.Yes {
-			yesNames = append(yesNames, "\n• " + formatUser(user.User))
-		} else {
-			noNames = append(noNames, "\n• " + formatUser(user.User))
+	choices := map[int]Choice{}
+	for idx, choiceStr := range whoMsg.Choices {
+		choices[idx] = Choice{
+			Choice: choiceStr,
+			Users: []string{},
 		}
 	}
 
-	return whoMsg.Question + "\n\n<b>Yes (" + strconv.Itoa(len(yesNames)) + "):</b>" + strings.Join(yesNames, "") + "\n<b>No (" + strconv.Itoa(len(noNames)) + "):</b>" + strings.Join(noNames, "")
+	for _, user := range whoMsg.Users {
+		choice, ok := choices[user.Choice]
+
+		newChoice := Choice{}
+		newChoice.Users = append(choice.Users, "\n• " + formatUser(user.User))
+
+		if ok {
+			newChoice.Choice = choice.Choice
+		} else {
+			if len(whoMsg.Choices) > user.Choice {
+				newChoice.Choice = whoMsg.Choices[user.Choice]
+			} else {
+				newChoice.Choice = "Unknown Choice"
+			}
+		}
+		choices[user.Choice] = newChoice
+	}
+
+	retStr := whoMsg.Question + "\n"
+	for i := range whoMsg.Choices {
+		choice := choices[i]
+		retStr += fmt.Sprintf("\n<b>%s (%d):</b>%s", choice.Choice, len(choice.Users), strings.Join(choice.Users, ""))
+	}
+
+	return retStr
 }
 
 func whoCBQuery(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
+	var err error
+
 	defer func(){
-		_, err := bot.AnswerCallbackQuery(tgbotapi.NewCallback(query.ID, ""))
+		var cbConfig tgbotapi.CallbackConfig
 		if err != nil {
+			cbConfig = tgbotapi.NewCallbackWithAlert(query.ID, "Error! " + err.Error())
+		} else {
+			cbConfig = tgbotapi.NewCallback(query.ID, "")
+		}
+		_, botErr := bot.AnswerCallbackQuery(cbConfig)
+		if botErr != nil {
 			log.Println("Error:", err)
 		}
 	}()
@@ -223,10 +265,12 @@ func whoCBQuery(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		msgID = query.InlineMessageID
 		whoMsg, ok = WhoMap[msgID]
 	} else {
+		err = errors.New("Cannot parse message")
 		return
 	}
 
 	if !ok {
+		err = errors.New("Cannot find question message")
 		return
 	}
 
@@ -238,36 +282,29 @@ func whoCBQuery(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		}
 	}
 
-	if query.Data == "1" {
-		// If YES
-		if theIdx != -1 {
-			if whoMsg.Users[theIdx].Yes {
-				whoMsg.Users[theIdx] = whoMsg.Users[len(whoMsg.Users)-1]
-				whoMsg.Users = whoMsg.Users[:len(whoMsg.Users)-1]
-			} else {
-				whoMsg.Users[theIdx].Yes = true
-			}
+	choiceIdx, err := strconv.Atoi(query.Data)
+	if err != nil {
+		return
+	}
+
+	if len(whoMsg.Choices) <= choiceIdx {
+		err = errors.New("Cannot find choice in question")
+		return
+	}
+
+	if theIdx != -1 {
+		userChoice := whoMsg.Users[theIdx].Choice
+		if userChoice == choiceIdx {
+			whoMsg.Users[theIdx] = whoMsg.Users[len(whoMsg.Users)-1]
+			whoMsg.Users = whoMsg.Users[:len(whoMsg.Users)-1]
 		} else {
-			whoMsg.Users = append(whoMsg.Users, WhoUser{
-				User: query.From,
-				Yes: true,
-			})
+			whoMsg.Users[theIdx].Choice = choiceIdx
 		}
-	} else if query.Data == "0" {
-		// If NO
-		if theIdx != -1 {
-			if !whoMsg.Users[theIdx].Yes {
-				whoMsg.Users[theIdx] = whoMsg.Users[len(whoMsg.Users)-1]
-				whoMsg.Users = whoMsg.Users[:len(whoMsg.Users)-1]
-			} else {
-				whoMsg.Users[theIdx].Yes = false
-			}
-		} else {
-			whoMsg.Users = append(whoMsg.Users, WhoUser{
-				User: query.From,
-				Yes: false,
-			})
-		}
+	} else {
+		whoMsg.Users = append(whoMsg.Users, WhoUser{
+			User: query.From,
+			Choice: choiceIdx,
+		})
 	}
 
 	var msg tgbotapi.EditMessageTextConfig
@@ -278,11 +315,11 @@ func whoCBQuery(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		msg = tgbotapi.NewEditMessageText(query.Message.Chat.ID, query.Message.MessageID, generateWhoList(whoMsg))
 	}
 
-	msg.ReplyMarkup = &inlineKeyboardWho
+	msg.ReplyMarkup = generateInlineKeyboard(whoMsg)
 	msg.ParseMode = "HTML"
 	msg.DisableWebPagePreview = true
-	_, err := bot.Send(msg)
-	if err != nil {
+	_, botErr := bot.Send(msg)
+	if botErr != nil {
 		log.Println("Error:", err)
 	}
 
@@ -294,17 +331,15 @@ func strToPointer(str string) *string {
 }
 
 func runWhoCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
-	question := message.CommandArguments()
-	if question == "" {
-		question = "Who's Down"
+	question, options, err := commandQuerySplit(message.CommandArguments())
+	if err != nil {
+		return
 	}
 
-	whoMsg := WhoMessage{
-		Question: question,
-	}
+	whoMsg := NewWhoMessage(question, options...)
 
 	msg := tgbotapi.NewMessage(message.Chat.ID, generateWhoList(whoMsg))
-	msg.ReplyMarkup = inlineKeyboardWho
+	msg.ReplyMarkup = generateInlineKeyboard(whoMsg)
 	msg.ParseMode = "HTML"
 	msg.DisableWebPagePreview = true
 	sentMsg, err := bot.Send(msg)
@@ -313,4 +348,54 @@ func runWhoCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	}
 
 	WhoMap[strconv.Itoa(sentMsg.MessageID)] = whoMsg
+}
+
+func commandQuerySplit(query string) (question string, options []string, err error) {
+	if query != "" {
+		if strings.Contains(query, "##") {
+			splitQ := strings.Split(query, "##")
+			if len(splitQ) != 2 {
+				question = query
+			} else {
+				question = splitQ[0]
+				options = strings.Split(splitQ[1], "#")
+			}
+
+		} else {
+			question = query
+		}
+	} else {
+		question = "Who's Down"
+	}
+
+	if len(options) > 10 {
+		err = errors.New("Too many options")
+		return
+	}
+
+	for i, val := range options {
+		options[i] = strings.TrimSpace(val)
+	}
+	question = strings.TrimSpace(question)
+	return
+}
+
+func runInlineQueryWhoCommand(bot *tgbotapi.BotAPI, iq *tgbotapi.InlineQuery) {
+	question, options, err := commandQuerySplit(iq.Query)
+	if err != nil {
+		return
+	}
+
+	whoMsg := NewWhoMessage(question, options...)
+	articleID := RandStringBytesMaskImprSrc(32)
+	ArticleIDMap[articleID] = whoMsg
+
+	res := tgbotapi.NewInlineQueryResultArticleHTML(articleID, question, generateWhoList(whoMsg))
+	res.ReplyMarkup = generateInlineKeyboard(whoMsg)
+	bot.AnswerInlineQuery(tgbotapi.InlineConfig{
+		InlineQueryID: iq.ID,
+		Results: []interface{}{
+			res,
+		},
+	})
 }
